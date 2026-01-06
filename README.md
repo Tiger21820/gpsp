@@ -2,7 +2,7 @@
 gpSP for libretro
 =================
 
-This is a fork of notaz's gpSP (https://github.com/notaz/gpsp) for libretro
+This is a fork of notaz's gpSP (https://github.com/notaz/gpsp) for libretroh
 frontends (like Retroarch). Check the original_readme.txt file for more info.
 
 The current maintainer/main contributor is davidgfnet (check out the repo at
