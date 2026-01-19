@@ -1,5 +1,5 @@
 
-gpSP for libretro
+gpSP for libretro4
 =================
 
 This is a fork of notaz's gpSP (https://github.com/notaz/gpsp) for libretro
