@@ -301,6 +301,7 @@ u32 function_cc update_gba(int remaining_cycles)
 
 void reset_gba(void)
 {
+  gbp_reset();
   init_memory();
   init_main();
   init_cpu();
@@ -334,6 +335,9 @@ bool main_check_savestate(const u8 *src)
       !bson_contains_key(p1, "video-count", BSON_TYPE_INT32) ||
       !bson_contains_key(p1, "sleep-cycles", BSON_TYPE_INT32))
     return false;
+  /* serial-irq-cycles is optional for forward compatibility with states
+   * written before this field existed; missing simply means "no pending
+   * serial IRQ", which is also the default after serialproto_reset. */
 
   for (i = 0; i < 4; i++)
   {
@@ -372,6 +376,30 @@ bool main_read_savestate(const u8 *src)
   if (!bson_read_int32(p1, "frame-count", &frame_counter))
     frame_counter = 60 * 10;  // Use "fake" 10 seconds.
 
+  {
+    u32 sirq;
+    if (bson_read_int32(p1, "serial-irq-cycles", &sirq))
+      serial_set_irq_cycles(sirq);
+    else
+      serial_set_irq_cycles(0);   /* Older states: no pending IRQ. */
+  }
+
+  /* random_state is also optional for backwards compat. Missing means
+   * 'use whatever is currently in the static'; the RFU path will reseed
+   * from cpu_ticks on the next rfu_reset, which is also deterministic. */
+  bson_read_int32(p1, "rand-state", &random_state);
+
+  /* gbp-state is optional for backwards compat.  Older states either
+   * never had a GBP session active or are post-handshake (steady-state
+   * loop where missing the precise gbp_seq_n is harmless within a few
+   * frames).  Default: don't touch the in-memory values, gbp_reset
+   * runs at content load and that's a safe starting point. */
+  {
+    u32 gbps;
+    if (bson_read_int32(p1, "gbp-state", &gbps))
+      gbp_set_state(gbps);
+  }
+
   for (i = 0; i < 4; i++)
   {
     char tname[2] = {'0' + i, 0};
@@ -401,6 +429,9 @@ unsigned main_write_savestate(u8* dst)
   bson_write_int32(dst, "exec-cycles", execute_cycles);
   bson_write_int32(dst, "video-count", video_count);
   bson_write_int32(dst, "sleep-cycles", reg[REG_SLEEP_CYCLES]);
+  bson_write_int32(dst, "serial-irq-cycles", serial_get_irq_cycles());
+  bson_write_int32(dst, "rand-state", random_state);
+  bson_write_int32(dst, "gbp-state", gbp_get_state());
   bson_finish_document(dst, wbptr);
 
   bson_start_document(dst, "timers", wbptr);
@@ -421,5 +452,4 @@ unsigned main_write_savestate(u8* dst)
 
   return (unsigned int)(dst - startp);
 }
-
 

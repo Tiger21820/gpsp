@@ -30,6 +30,8 @@ unsigned turbo_a_counter   = 0;
 unsigned turbo_b_counter   = 0;
 
 static u32 old_key = 0;
+static u32 gbp_keypad_frames = 0;
+static bool gbp_keypad_sent = false;
 static retro_input_state_t input_state_cb;
 
 void retro_set_input_state(retro_input_state_t cb) { input_state_cb = cb; }
@@ -123,13 +125,35 @@ u32 update_input(void)
    else
       turbo_b_counter = 0;
 
-   // GBP keypad detection hack (only at game startup!)
-   if (serial_mode == SERIAL_MODE_GBP) {
-     // During the startup screen (aproximate)
-     if (frame_counter > 20 && frame_counter < 100) {
-       // Emulate 4 keypad buttons pressed (which is impossible).
-       new_key = (frame_counter % 3) ? 0x3FF : 0x30F;
-     }
+   // GBP keypad detection hack (only once when game ROM starts running).
+   // This must work with both boot-to-ROM and boot-to-BIOS flows.
+   if (frame_counter == 0)
+   {
+      gbp_keypad_frames = 0;
+      gbp_keypad_sent = false;
+   }
+
+   if (serial_mode == SERIAL_MODE_GBP)
+   {
+      bool game_rom_running = reg[REG_PC] >= 0x08000000 && reg[REG_PC] < 0x0E000000;
+
+      if (!gbp_keypad_sent && game_rom_running)
+      {
+         gbp_keypad_frames = 96;
+         gbp_keypad_sent = true;
+      }
+
+      if (gbp_keypad_frames > 0)
+      {
+         // Emulate 4 keypad buttons pressed (which is impossible).
+         new_key = (gbp_keypad_frames & 1) ? 0x3FF : 0x30F;
+         gbp_keypad_frames--;
+      }
+   }
+   else
+   {
+      gbp_keypad_frames = 0;
+      gbp_keypad_sent = false;
    }
 
    if ((new_key | old_key) != old_key)
@@ -151,15 +175,28 @@ u32 update_input(void)
 bool input_check_savestate(const u8 *src)
 {
   const u8 *p = bson_find_key(src, "input");
+  /* Only 'prevkey' is required for backwards compatibility. The other
+   * fields are optional and default to a safe state on load. */
   return (p && bson_contains_key(p, "prevkey", BSON_TYPE_INT32));
 }
 
 bool input_read_savestate(const u8 *src)
 {
   const u8 *p = bson_find_key(src, "input");
-  if (p)
-    return bson_read_int32(p, "prevkey", &old_key);
-  return false;
+  u32 v;
+  if (!p)
+    return false;
+  if (!bson_read_int32(p, "prevkey", &old_key))
+    return false;
+
+  /* Optional turbo and GBP fields - default to neutral state when
+   * absent (older savestates).  Without these, turbo-button pulse and
+   * GBP detection desync across save/load, breaking input determinism. */
+  turbo_a_counter   = bson_read_int32(p, "turbo-a", &v) ? v : 0;
+  turbo_b_counter   = bson_read_int32(p, "turbo-b", &v) ? v : 0;
+  gbp_keypad_frames = bson_read_int32(p, "gbp-frames", &v) ? v : 0;
+  gbp_keypad_sent   = bson_read_int32(p, "gbp-sent",   &v) ? (v != 0) : false;
+  return true;
 }
 
 unsigned input_write_savestate(u8 *dst)
@@ -167,8 +204,11 @@ unsigned input_write_savestate(u8 *dst)
   u8 *wbptr1, *startp = dst;
   bson_start_document(dst, "input", wbptr1);
   bson_write_int32(dst, "prevkey", old_key);
+  bson_write_int32(dst, "turbo-a", turbo_a_counter);
+  bson_write_int32(dst, "turbo-b", turbo_b_counter);
+  bson_write_int32(dst, "gbp-frames", gbp_keypad_frames);
+  bson_write_int32(dst, "gbp-sent", gbp_keypad_sent ? 1 : 0);
   bson_finish_document(dst, wbptr1);
   return (unsigned int)(dst - startp);
 }
-
 

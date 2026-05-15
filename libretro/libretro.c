@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #include <streams/file_stream.h>
+#include <compat/strl.h>
 #include <libretro.h>
 
 #include "../common.h"
@@ -210,85 +211,90 @@ static void init_frameskip(void)
 
 static void video_post_process_cc(void)
 {
-   uint16_t *src = gba_screen_pixels;
-   uint16_t *dst = gba_processed_pixels;
-   size_t x, y;
+   const uint16_t *src = gba_screen_pixels;
+   uint16_t       *dst = gba_processed_pixels;
+   const size_t    npx = GBA_SCREEN_HEIGHT * GBA_SCREEN_PITCH;
+   size_t i;
 
-   for (y = 0; y < GBA_SCREEN_HEIGHT; y++)
+   for (i = 0; i < npx; i++)
    {
-      for (x = 0; x < GBA_SCREEN_PITCH; x++)
-      {
-         u16 src_color = *(src + x);
+      uint16_t src_color = src[i];
 
-         /* Convert colour to RGB555 and perform lookup */
-         *(dst + x) = *(gba_cc_lut + (((src_color & 0xFFC0) >> 1) | (src_color & 0x1F)));
-      }
-
-      src += GBA_SCREEN_PITCH;
-      dst += GBA_SCREEN_PITCH;
+      /* Convert colour to RGB555 and perform lookup */
+      dst[i] = gba_cc_lut[((src_color & 0xFFC0) >> 1) | (src_color & 0x1F)];
    }
 }
 
 static void video_post_process_mix(void)
 {
-   uint16_t *src_curr = gba_screen_pixels;
-   uint16_t *src_prev = gba_screen_pixels_prev;
-   uint16_t *dst      = gba_processed_pixels;
-   size_t x, y;
+   /* Flat loop: pitch equals width so the row-stride bookkeeping in
+    * the original two-level form was bookkeeping for no actual stride
+    * mismatch.  Compilers can vectorize the flat loop more aggressively;
+    * on ARM Cortex-A it makes a measurable difference at -O2.  After the
+    * mix we used to memcpy(prev, curr, 75 KB) so the next frame's mix
+    * could read the previous frame; that copy is now elided by swapping
+    * the two buffer pointers - after the swap, gba_screen_pixels points
+    * to what was the prev buffer (about to be overwritten by the next
+    * scanline-render pass), and gba_screen_pixels_prev points at the
+    * just-rendered frame.  Saves ~4.5 MB/s of memory bandwidth at 60 fps
+    * with mix enabled. */
+   const uint16_t *src_curr = gba_screen_pixels;
+   const uint16_t *src_prev = gba_screen_pixels_prev;
+   uint16_t       *dst      = gba_processed_pixels;
+   const size_t    npx      = GBA_SCREEN_HEIGHT * GBA_SCREEN_PITCH;
+   size_t i;
 
-   for (y = 0; y < GBA_SCREEN_HEIGHT; y++)
+   for (i = 0; i < npx; i++)
    {
-      for (x = 0; x < GBA_SCREEN_PITCH; x++)
-      {
-         /* Get colours from current + previous frames (RGB565) */
-         uint16_t rgb_curr = *(src_curr + x);
-         uint16_t rgb_prev = *(src_prev + x);
+      uint16_t rgb_curr = src_curr[i];
+      uint16_t rgb_prev = src_prev[i];
 
-         /* Store colours for next frame */
-         *(src_prev + x)   = rgb_curr;
+      /* Mix colours:
+       *   http://blargg.8bitalley.com/info/rgb_mixing.html */
+      dst[i] = (rgb_curr + rgb_prev + ((rgb_curr ^ rgb_prev) & 0x821)) >> 1;
+   }
 
-         /* Mix colours
-          * > "Mixing Packed RGB Pixels Efficiently"
-          *   http://blargg.8bitalley.com/info/rgb_mixing.html */
-         *(dst + x)        = (rgb_curr + rgb_prev + ((rgb_curr ^ rgb_prev) & 0x821)) >> 1;
-      }
-
-      src_curr += GBA_SCREEN_PITCH;
-      src_prev += GBA_SCREEN_PITCH;
-      dst      += GBA_SCREEN_PITCH;
+   /* Swap curr/prev: the just-rendered frame becomes prev for next time,
+    * and the previous prev (now stale and about to be overwritten by the
+    * next render pass) becomes the new render target.  Equivalent to the
+    * old 'memcpy(prev, curr, GBA_SCREEN_BUFFER_SIZE)' but without the
+    * copy.  Safe because the scanline renderer fully overwrites every
+    * pixel of gba_screen_pixels before any read (fill_line_background
+    * runs first per scanline) - no read-before-write hazard on the
+    * post-swap buffer. */
+   {
+      u16 *t = gba_screen_pixels;
+      gba_screen_pixels = gba_screen_pixels_prev;
+      gba_screen_pixels_prev = t;
    }
 }
 
 static void video_post_process_cc_mix(void)
 {
-   uint16_t *src_curr = gba_screen_pixels;
-   uint16_t *src_prev = gba_screen_pixels_prev;
-   uint16_t *dst      = gba_processed_pixels;
-   size_t x, y;
+   /* See video_post_process_mix for the loop-flatten + buffer-swap
+    * rationale.  Same shape, plus the gba_cc_lut colour-correction
+    * lookup on the mixed value. */
+   const uint16_t *src_curr = gba_screen_pixels;
+   const uint16_t *src_prev = gba_screen_pixels_prev;
+   uint16_t       *dst      = gba_processed_pixels;
+   const size_t    npx      = GBA_SCREEN_HEIGHT * GBA_SCREEN_PITCH;
+   size_t i;
 
-   for (y = 0; y < GBA_SCREEN_HEIGHT; y++)
+   for (i = 0; i < npx; i++)
    {
-      for (x = 0; x < GBA_SCREEN_PITCH; x++)
-      {
-         /* Get colours from current + previous frames (RGB565) */
-         uint16_t rgb_curr = *(src_curr + x);
-         uint16_t rgb_prev = *(src_prev + x);
+      uint16_t rgb_curr = src_curr[i];
+      uint16_t rgb_prev = src_prev[i];
 
-         /* Store colours for next frame */
-         *(src_prev + x)   = rgb_curr;
+      uint16_t rgb_mix  = (rgb_curr + rgb_prev + ((rgb_curr ^ rgb_prev) & 0x821)) >> 1;
 
-         /* Mix colours
-          * > "Mixing Packed RGB Pixels Efficiently"
-          *   http://blargg.8bitalley.com/info/rgb_mixing.html */
-         uint16_t rgb_mix  = (rgb_curr + rgb_prev + ((rgb_curr ^ rgb_prev) & 0x821)) >> 1;
+      /* Convert colour to RGB555 and perform lookup */
+      dst[i] = gba_cc_lut[((rgb_mix & 0xFFC0) >> 1) | (rgb_mix & 0x1F)];
+   }
 
-         /* Convert colour to RGB555 and perform lookup */
-         *(dst + x) = *(gba_cc_lut + (((rgb_mix & 0xFFC0) >> 1) | (rgb_mix & 0x1F)));
-      }
-
-      src_curr += GBA_SCREEN_PITCH;
-      src_prev += GBA_SCREEN_PITCH;
-      dst      += GBA_SCREEN_PITCH;
+   {
+      u16 *t = gba_screen_pixels;
+      gba_screen_pixels = gba_screen_pixels_prev;
+      gba_screen_pixels_prev = t;
    }
 }
 
@@ -317,25 +323,36 @@ static void init_post_processing(void)
       memset(gba_processed_pixels, 0xFFFF, GBA_SCREEN_BUFFER_SIZE);
    }
 
-   /* Initialise 'history' buffer, if required */
+   /* Initialise 'history' buffer, if required.  If this alloc fails we
+    * must NOT fall through to the mix-variant assignment below: those
+    * functions dereference gba_screen_pixels_prev unconditionally.
+    * Leave the user setting (post_process_mix) intact - the failure
+    * may be transient - but skip the function-pointer assignment for
+    * the mix path so video_run keeps working. */
    if (!gba_screen_pixels_prev &&
        post_process_mix)
    {
       gba_screen_pixels_prev = (u16*)malloc(GBA_SCREEN_BUFFER_SIZE);
 
-      if (!gba_screen_pixels_prev)
-         return;
-
-      memset(gba_screen_pixels_prev, 0xFFFF, GBA_SCREEN_BUFFER_SIZE);
+      if (!gba_screen_pixels_prev && log_cb)
+         log_cb(RETRO_LOG_WARN,
+                "Failed to allocate frame history buffer; disabling mix component of post-processing this run\n");
+      else if (gba_screen_pixels_prev)
+         memset(gba_screen_pixels_prev, 0xFFFF, GBA_SCREEN_BUFFER_SIZE);
    }
 
-   /* Assign post processing function */
-   if (post_process_cc && post_process_mix)
-      video_post_process = video_post_process_cc_mix;
-   else if (post_process_cc)
-      video_post_process = video_post_process_cc;
-   else if (post_process_mix)
-      video_post_process = video_post_process_mix;
+   /* Assign post processing function.  Treat post_process_mix as
+    * effectively false if the history buffer is missing. */
+   {
+      bool mix_active = post_process_mix && (gba_screen_pixels_prev != NULL);
+
+      if (post_process_cc && mix_active)
+         video_post_process = video_post_process_cc_mix;
+      else if (post_process_cc)
+         video_post_process = video_post_process_cc;
+      else if (mix_active)
+         video_post_process = video_post_process_mix;
+   }
 }
 
 /* Video post processing END */
@@ -370,6 +387,11 @@ static void audio_run(void)
    s16 *audio_buffer_ptr;
    u32 samples_to_read;
    u32 samples_produced;
+
+   /* If retro_init's malloc failed we still get called every frame;
+    * skip the work in that case rather than write through NULL. */
+   if (!audio_sample_buffer)
+      return;
 
    /* audio_samples_per_frame is decimal;
     * get integer component */
@@ -557,6 +579,17 @@ void retro_init(void)
    audio_samples_accumulator = 0.0f;
    audio_sample_buffer_size  = ((u32)audio_samples_per_frame + 1) * 2;
    audio_sample_buffer       = (s16*)malloc(audio_sample_buffer_size * sizeof(s16));
+   if (!audio_sample_buffer)
+   {
+      if (log_cb)
+         log_cb(RETRO_LOG_ERROR,
+                "Failed to allocate audio sample buffer (%u bytes)\n",
+                (unsigned)(audio_sample_buffer_size * sizeof(s16)));
+      /* Continue: audio_run() now guards against this NULL and the
+       * frontend just runs silent.  Better than failing retro_init
+       * outright on memory-constrained targets where a small audio
+       * allocation may fail but the rest of the core still works. */
+   }
 
 #if defined(HAVE_DYNAREC)
   #if defined(MMAP_JIT_CACHE)
@@ -621,6 +654,16 @@ void retro_init(void)
 #else
       gba_screen_pixels = (uint16_t*)malloc(GBA_SCREEN_BUFFER_SIZE);
 #endif
+
+   /* gba_screen_pixels is dereferenced unconditionally by both the
+    * renderer (writes from update_scanline) and the post-process /
+    * video_cb hand-off in video_run.  A NULL here means we cannot
+    * safely run a single frame.  Log loudly; load_game will return
+    * the failure to the frontend so the core unloads cleanly. */
+   if (!gba_screen_pixels && log_cb)
+      log_cb(RETRO_LOG_ERROR,
+             "Failed to allocate frame buffer (%u bytes); core will refuse to load content\n",
+             (unsigned)GBA_SCREEN_BUFFER_SIZE);
 
    libretro_supports_bitmasks = false;
    if (environ_cb(RETRO_ENVIRONMENT_GET_INPUT_BITMASKS, NULL))
@@ -799,7 +842,18 @@ void retro_cheat_reset(void)
 void retro_cheat_set(unsigned index, bool enabled, const char* code)
 {
    if (!enabled)
+   {
+      /* Per the libretro contract, retro_cheat_set with enabled=false
+       * must deactivate the cheat at this index.  Without this, a user
+       * toggling a cheat off in the frontend would have no effect:
+       * the cheat would stay active until the next retro_cheat_reset()
+       * or content load.  Note RetroArch typically calls
+       * retro_cheat_reset followed by a full reapply on every change,
+       * so the visible bug surface is small, but other frontends and
+       * runtime API callers can hit this directly. */
+      cheat_disable(index);
       return;
+   }
 
    switch (cheat_parse(index, code))
    {
@@ -822,15 +876,16 @@ void retro_cheat_set(unsigned index, bool enabled, const char* code)
 
 static void extract_directory(char* buf, const char* path, size_t size)
 {
-   strncpy(buf, path, size - 1);
-   buf[size - 1] = '\0';
+   char* base;
 
-   char* base = strrchr(buf, '/');
+   strlcpy(buf, path, size);
+
+   base = strrchr(buf, '/');
 
    if (base)
       *base = '\0';
    else
-      strncpy(buf, ".", size);
+      strlcpy(buf, ".", size);
 }
 
 static void check_variables(bool started_from_load)
@@ -1084,7 +1139,14 @@ static void set_memory_descriptors(void)
 
 bool retro_load_game(const struct retro_game_info* info)
 {
-   if (!info)
+   if (!info || !info->path)
+      return false;
+
+   /* If retro_init failed to allocate the frame buffer, refuse to load
+    * rather than crash on the first video_run.  retro_init is allowed
+    * to fail allocations silently; this is the point at which we have
+    * to decide whether the core can usefully run. */
+   if (!gba_screen_pixels)
       return false;
 
    check_variables(true);
@@ -1099,16 +1161,24 @@ bool retro_load_game(const struct retro_game_info* info)
 
    extract_directory(main_path, info->path, sizeof(main_path));
 
-   if (environ_cb(RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY, &dir) && dir)
-      strcpy(filename_bios, dir);
-   else
-      strcpy(filename_bios, main_path);
-
    bool bios_loaded = false;
    if (selected_bios == auto_detect || selected_bios == official_bios)
    {
+     /* Build '<dir>/gba_bios.bin'.  strlcpy returns the source length,
+      * so we can reuse it as the offset for the suffix append - one
+      * less strlen call than a strlcat-style pattern, and bounded
+      * against MAX_PATH overflow either way.  If the directory path
+      * was already truncated (len >= sizeof(filename_bios)), the
+      * subsequent load_bios will fail and we fall back to the
+      * built-in BIOS - the right outcome for a pathological frontend
+      * path. */
+     const char *base_dir = (environ_cb(RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY, &dir) && dir)
+                            ? dir : main_path;
+     size_t len = strlcpy(filename_bios, base_dir, sizeof(filename_bios));
+     if (len < sizeof(filename_bios))
+        strlcpy(filename_bios + len, "/gba_bios.bin", sizeof(filename_bios) - len);
+
      bios_loaded = true;
-     strcat(filename_bios, "/gba_bios.bin");
 
      if (load_bios(filename_bios) != 0)
      {
@@ -1136,6 +1206,29 @@ bool retro_load_game(const struct retro_game_info* info)
       error_msg("Could not load the game file.");
       return false;
    }
+
+   if (selected_bios != builtin_bios && gamepak_header_nonstandard)
+   {
+      show_warning_message("Non-standard ROM header detected, using built-in BIOS", 2500);
+      memcpy(bios_rom, open_gba_bios_rom, sizeof(bios_rom));
+   }
+
+   extern bool require_m1_hle_bios;
+
+   if (selected_bios != builtin_bios && require_m1_hle_bios)
+   {
+      show_warning_message("Pokemon ROM Hack (M1) detected, forcing built-in BIOS", 2500);
+      memcpy(bios_rom, open_gba_bios_rom, sizeof(bios_rom));
+   }
+
+#ifdef HAVE_DYNAREC
+   if (gamepak_mini_materialized && dynarec_enable)
+   {
+      dynarec_enable = 0;
+      flush_dynarec_caches();
+      show_warning_message("Mini ROM detected, dynamic recompiler disabled", 2500);
+   }
+#endif
 
    struct retro_rumble_interface rumbleif;
    if (environ_cb(RETRO_ENVIRONMENT_GET_RUMBLE_INTERFACE, &rumbleif))
