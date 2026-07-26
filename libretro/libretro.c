@@ -59,6 +59,33 @@ static s16 *audio_sample_buffer        = NULL;
 static float audio_samples_per_frame   = 0.0f;
 static float audio_samples_accumulator = 0.0f;
 
+/* Apply the gpsp_sound_rate core option. reinit_env is non-NULL only for
+ * mid-session changes (retro_run variable check), where issuing
+ * RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO is legal; at load time the new rate
+ * is picked up by the normal av_info and buffer init paths. */
+static void gpsp_apply_sound_rate(const char *value, retro_environment_t reinit_env)
+{
+   u32 new_bits = (value && !strcmp(value, "32768")) ? 15 : 16;
+
+   if (new_bits == sound_freq_bits)
+      return;
+
+   sound_freq_bits = new_bits;
+   sound_frequency = 1u << new_bits;
+   audio_samples_per_frame   = (float)sound_frequency / (float)(GBA_FPS);
+   audio_samples_accumulator = 0.0f;
+
+   if (reinit_env)
+   {
+      struct retro_system_av_info av_info;
+      render_gbc_sound();          /* drain pending ticks at the old rate */
+      sound_frequency_changed();   /* recompute all derived steps */
+      sound_flush_ring();
+      retro_get_system_av_info(&av_info);
+      reinit_env(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &av_info);
+   }
+}
+
 /* Workaround for a RetroArch audio driver
  * limitation: a maximum of 1024 frames
  * can be written per call of audio_batch_cb() */
@@ -569,15 +596,15 @@ void retro_get_system_av_info(struct retro_system_av_info* info)
    info->geometry.max_height = GBA_SCREEN_HEIGHT;
    info->geometry.aspect_ratio = 3.0f / 2.0f;
    info->timing.fps = ((float) GBA_FPS);
-   info->timing.sample_rate = GBA_SOUND_FREQUENCY;
+   info->timing.sample_rate = sound_frequency;
 }
 
 void retro_init(void)
 {
    u32 audio_sample_buffer_size;
-   audio_samples_per_frame   = (float)(GBA_SOUND_FREQUENCY) / (float)(GBA_FPS);
+   audio_samples_per_frame   = (float)sound_frequency / (float)(GBA_FPS);
    audio_samples_accumulator = 0.0f;
-   audio_sample_buffer_size  = ((u32)audio_samples_per_frame + 1) * 2;
+   audio_sample_buffer_size  = (((u32)((float)(GBA_SOUND_FREQUENCY) / (float)(GBA_FPS))) + 1) * 2;
    audio_sample_buffer       = (s16*)malloc(audio_sample_buffer_size * sizeof(s16));
    if (!audio_sample_buffer)
    {
@@ -995,6 +1022,14 @@ static void check_variables(bool started_from_load)
       else if (strcmp(var.value, "enabled") == 0)
          sprite_limit = 0;
    }
+   {
+      static int sound_rate_configured = 0;
+      struct retro_variable svar = { "gpsp_sound_rate", NULL };
+      environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &svar);
+      gpsp_apply_sound_rate(svar.value, sound_rate_configured ? environ_cb : NULL);
+      sound_rate_configured = 1;
+   }
+
 
    var.key                = "gpsp_frameskip";
    var.value              = 0;

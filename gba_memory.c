@@ -43,8 +43,7 @@
   render_gbc_sound();                                                         \
   u32 rate = value & 0x7FF;                                                   \
   gbc_sound_channel[channel].rate = rate;                                     \
-  gbc_sound_channel[channel].frequency_step =                                 \
-   (fixed16_16)(1048576u / (2048 - rate));                                    \
+  gbc_sound_channel[channel].frequency_step = psg_tone_step(rate);            \
   gbc_sound_channel[channel].length_status = (value >> 14) & 0x01;            \
   if(value & 0x8000)                                                          \
   {                                                                           \
@@ -103,8 +102,7 @@ static const u32 gbc_sound_wave_volume[4] = { 0, 16384, 8192, 4096 };
   render_gbc_sound();                                                         \
   u32 rate = value & 0x7FF;                                                   \
   gbc_sound_channel[2].rate = rate;                                           \
-  gbc_sound_channel[2].frequency_step =                                       \
-   (fixed16_16)(2097152u / (2048 - rate));                                    \
+  gbc_sound_channel[2].frequency_step = psg_wave_step(rate);                  \
   gbc_sound_channel[2].length_status = (value >> 14) & 0x01;                  \
   if(value & 0x8000)                                                          \
   {                                                                           \
@@ -119,16 +117,8 @@ static const u32 gbc_sound_wave_volume[4] = { 0, 16384, 8192, 4096 };
   u32 dividing_ratio = value & 0x07;                                          \
   u32 frequency_shift = (value >> 4) & 0x0F;                                  \
   render_gbc_sound();                                                         \
-  if(dividing_ratio == 0)                                                     \
-  {                                                                           \
-    gbc_sound_channel[3].frequency_step =                                     \
-     (fixed16_16)(1048576u >> (frequency_shift + 1));                         \
-  }                                                                           \
-  else                                                                        \
-  {                                                                           \
-    gbc_sound_channel[3].frequency_step =                                     \
-     (fixed16_16)(524288u / (dividing_ratio << (frequency_shift + 1)));       \
-  }                                                                           \
+  gbc_sound_channel[3].frequency_step =                                       \
+   psg_noise_step(dividing_ratio, frequency_shift);                           \
   gbc_sound_channel[3].noise_type = (value >> 3) & 0x01;                      \
   gbc_sound_channel[3].length_status = (value >> 14) & 0x01;                  \
   if(value & 0x8000)                                                          \
@@ -202,11 +192,36 @@ static void sound_control_x(u32 value)
 #define sound_update_frequency_step(timer_number)                             \
   timer[timer_number].frequency_step =                                        \
    (fixed8_24)(((u64)GBC_BASE_RATE_INT << 24) /                               \
-    ((u64)GBA_SOUND_FREQUENCY * (timer_reload)))                              \
+    ((u64)sound_frequency * (timer_reload)))                                  \
 
 /* Main */
 extern timer_type timer[4];
 static const u32 prescale_table[] = { 0, 6, 8, 10 };
+
+/* Recompute every rate-derived frequency step from primary state. Called on
+ * an output-rate change and after savestate load. Tone/wave recompute from
+ * gs->rate (the ioreg copy goes stale when the sweep unit mutates the rate);
+ * noise recomputes from REG_SOUND4CNT_H (bits 0-2 and 4-7 survive the 0x40FF
+ * write mask). Timer steps use reload << prescale as in count_timer /
+ * trigger_timer; zero reloads are skipped. */
+void sound_frequency_changed(void)
+{
+   u32 i;
+   u16 snd4 = read_ioreg(REG_SOUND4CNT_H);
+
+   gbc_sound_channel[0].frequency_step = psg_tone_step(gbc_sound_channel[0].rate);
+   gbc_sound_channel[1].frequency_step = psg_tone_step(gbc_sound_channel[1].rate);
+   gbc_sound_channel[2].frequency_step = psg_wave_step(gbc_sound_channel[2].rate);
+   gbc_sound_channel[3].frequency_step =
+      psg_noise_step(snd4 & 0x07, (snd4 >> 4) & 0x0F);
+
+   for(i = 0; i < 2; i++)
+   {
+      u32 timer_reload = timer[i].reload << timer[i].prescale;
+      if(timer_reload)
+         sound_update_frequency_step(i);
+   }
+}
 
 #define count_timer(timer_number)                                             \
   timer[timer_number].reload = 0x10000 - value;                               \
@@ -253,7 +268,7 @@ static void trigger_timer(u32 timer_number, u32 value)
          {
             u32 buffer_adjust =
                (u32)(((u64)(cpu_ticks - gbc_sound_last_cpu_ticks) *
-                        GBA_SOUND_FREQUENCY) / GBC_BASE_RATE_INT) * 2;
+                        sound_frequency) / GBC_BASE_RATE_INT) * 2;
 
             sound_update_frequency_step(timer_number);
             adjust_sound_buffer(timer_number, 0);

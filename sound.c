@@ -23,10 +23,17 @@
 direct_sound_struct direct_sound_channel[2];
 gbc_sound_struct gbc_sound_channel[4];
 
-const u32 sound_frequency = GBA_SOUND_FREQUENCY;
+u32 sound_frequency = GBA_SOUND_FREQUENCY;
+u32 sound_freq_bits = 16;
 
 u32 sound_on;
-static s16 sound_buffer[BUFFER_SIZE];
+/* Mix bus. Accumulates all six channels at full 16-bit output scale
+ * (PSG full swing +/-8192 per channel, direct sound +/-32768 per channel;
+ * worst-case |sum| = 4*8192 + 2*32768 = 98304, so s32 entries are required).
+ * Historically this was an s16 buffer at 12-bit scale with a x16 shift at
+ * readout, which quantized every channel to a 12-bit grid before mixing and
+ * left the bottom 4 bits of the libretro output permanently zero. */
+static s32 sound_buffer[BUFFER_SIZE];
 static u32 sound_buffer_base;
 
 static fixed16_16 gbc_sound_tick_step;
@@ -59,11 +66,14 @@ unsigned sound_timer(fixed8_24 frequency_step, u32 channel)
 
   fixed8_24 fifo_fractional = ds->fifo_fractional;
   u32 buffer_index = ds->buffer_index;
-  s16 current_sample, next_sample;
+  s32 current_sample, next_sample;
 
-  current_sample = ds->fifo[ds->fifo_base] * 16;
+  /* 8-bit FIFO samples placed at full 16-bit scale; x256 is exact, so no
+   * precision is created or lost here, but the interpolator below now
+   * resolves 4 more fractional bits than it did at the old x16 scale. */
+  current_sample = ds->fifo[ds->fifo_base] * 256;
   ds->fifo_base = (ds->fifo_base + 1) % 32;
-  next_sample = ds->fifo[ds->fifo_base] * 16;
+  next_sample = ds->fifo[ds->fifo_base] * 256;
 
   if(sound_on == 1)
   {
@@ -93,8 +103,10 @@ unsigned sound_timer(fixed8_24 frequency_step, u32 channel)
         /* render samples RIGHT */
         while(fifo_fractional <= 0xFFFFFF)
         {
-           s16 dest_sample = current_sample +
-              fp16_16_to_u32((next_sample - current_sample) * (fifo_fractional >> 8));
+           /* diff can reach +/-65280 and the fraction 65535, so the
+            * product needs 64 bits (single smull/mulh on 32-bit targets). */
+           s32 dest_sample = current_sample + (s32)
+              ((((s64)(next_sample - current_sample) * (fifo_fractional >> 8)) + (1 << 15)) >> 16);
 
            sound_buffer[buffer_index + 1]     += dest_sample;
 
@@ -107,8 +119,8 @@ unsigned sound_timer(fixed8_24 frequency_step, u32 channel)
         /* render samples LEFT */
         while(fifo_fractional <= 0xFFFFFF)
         {
-           s16 dest_sample = current_sample +
-              fp16_16_to_u32((next_sample - current_sample) * (fifo_fractional >> 8));
+           s32 dest_sample = current_sample + (s32)
+              ((((s64)(next_sample - current_sample) * (fifo_fractional >> 8)) + (1 << 15)) >> 16);
 
            sound_buffer[buffer_index]     += dest_sample;
 
@@ -121,8 +133,8 @@ unsigned sound_timer(fixed8_24 frequency_step, u32 channel)
         /* render samples LEFT and RIGHT. */
         while(fifo_fractional <= 0xFFFFFF)
         {
-           s16 dest_sample = current_sample +
-              fp16_16_to_u32((next_sample - current_sample) * (fifo_fractional >> 8));
+           s32 dest_sample = current_sample + (s32)
+              ((((s64)(next_sample - current_sample) * (fifo_fractional >> 8)) + (1 << 15)) >> 16);
 
            sound_buffer[buffer_index]     += dest_sample;
            sound_buffer[buffer_index + 1] += dest_sample;
@@ -250,10 +262,7 @@ u32 gbc_sound_master_volume;
         break;                                                                \
       }                                                                       \
                                                                               \
-      /* (131072/(2048-rate))*8 / sound_frequency, in 16.16 fixed point.      \
-       * sound_frequency == 2^16 makes this exactly 2^20/(2048-rate).         \
-       * Verified bit-identical to the float form for rate 0..2047.           */ \
-      frequency_step = (fixed16_16)(1048576u / (2048 - rate));                \
+      frequency_step = psg_tone_step(rate);                                   \
                                                                               \
       gs->frequency_step = frequency_step;                                    \
       gs->rate = rate;                                                        \
@@ -317,11 +326,17 @@ u32 gbc_sound_master_volume;
     tick_counter &= 0xFFFF;                                                   \
   }                                                                           \
 
+/* Volume product carries 22 fractional bits below the old 12-bit grid;
+ * keep 4 of them by accumulating at 16-bit scale, rounding to nearest.
+ * Overflow-safe in s32: the product spans [-2^31, 7 * 2^28] and adding the
+ * half-LSB 2^17 cannot exceed INT32_MAX nor underflow INT32_MIN. */
 #define gbc_sound_render_sample_right()                                       \
-  sound_buffer[buffer_index + 1] += (current_sample * volume_right) >> 22     \
+  sound_buffer[buffer_index + 1] +=                                           \
+   (current_sample * volume_right + (1 << 17)) >> 18                          \
 
 #define gbc_sound_render_sample_left()                                        \
-  sound_buffer[buffer_index] += (current_sample * volume_left) >> 22          \
+  sound_buffer[buffer_index] +=                                               \
+   (current_sample * volume_left + (1 << 17)) >> 18                           \
 
 #define gbc_sound_render_sample_both()                                        \
   gbc_sound_render_sample_right();                                            \
@@ -416,9 +431,9 @@ void render_gbc_sound()
    * across toolchains/arches (the old float form depended on x87 vs SSE
    * rounding and FMA contraction, and lost mantissa bits for large deltas
    * in the overclock build). In the default build this is exactly
-   * tick_delta * 256. */
+   * tick_delta * 256 at 65536 Hz, tick_delta * 128 at 32768 Hz. */
   fixed16_16 buffer_ticks = (fixed16_16)
-   ((((u64)tick_delta * GBA_SOUND_FREQUENCY) << 16) / GBC_BASE_RATE_INT);
+   ((((u64)tick_delta * sound_frequency) << 16) / GBC_BASE_RATE_INT);
   if (!tick_delta)
     return;
 
@@ -660,7 +675,7 @@ bool sound_read_savestate(const u8 *src)
   int i;
   const u8 *snddoc = bson_find_key(src, "sound");
 
-  /* The 128KiB ring buffer holding rendered samples is intentionally not
+  /* The 256KiB ring buffer holding rendered samples is intentionally not
    * serialized (it would inflate the savestate well beyond its hard size
    * cap). Zero it on load so that the gbc_sound and direct_sound mixers,
    * which use += into this buffer, do not pick up stale data from before
@@ -836,12 +851,12 @@ u32 sound_read_samples(s16 *out, u32 frames)
 
       sound_buffer[source_index] = 0;
 
-      if(current_sample > 2047)
-         current_sample = 2047;
-      if(current_sample < -2048)
-         current_sample = -2048;
+      if(current_sample > 32767)
+         current_sample = 32767;
+      if(current_sample < -32768)
+         current_sample = -32768;
 
-      out[i] = current_sample * 16;
+      out[i] = current_sample;
    }
 
    sound_buffer_base += samples_to_read;
@@ -849,4 +864,16 @@ u32 sound_read_samples(s16 *out, u32 frames)
 
    /* Function returns number of frames read */
    return (samples_to_read >> 1);
+}
+
+/* Discard everything queued in the ring and realign all producers and the
+ * consumer. Called on an output-rate change: pending samples were rendered
+ * at the old rate. Costs up to the 512-sample readout holdback of silence
+ * while the ring refills; deterministic. */
+void sound_flush_ring(void)
+{
+   memset(sound_buffer, 0, sizeof(sound_buffer));
+   sound_buffer_base = gbc_sound_buffer_index;
+   direct_sound_channel[0].buffer_index = gbc_sound_buffer_index;
+   direct_sound_channel[1].buffer_index = gbc_sound_buffer_index;
 }

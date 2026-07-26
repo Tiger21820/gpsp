@@ -23,6 +23,46 @@
 #define BUFFER_SIZE        (1 << 16)
 #define BUFFER_SIZE_MASK   (BUFFER_SIZE - 1)
 
+/* Runtime output rate, restricted to powers of two so that all fixed point
+ * frequency steps below remain exact against the 2^24 Hz master clock.
+ * sound_frequency == 1u << sound_freq_bits, and is at most
+ * GBA_SOUND_FREQUENCY (which stays the compile-time maximum, used for
+ * buffer sizing). */
+extern u32 sound_frequency;
+extern u32 sound_freq_bits;
+
+/* PSG frequency steps in 16.16 sample-index units for the current rate.
+ * Tone (ch 0/1): (131072/(2048-rate))*8 / f_s  ==  2^(36-b)/(2048-rate)
+ * Wave (ch 2):   double the tone clock         ==  2^(37-b)/(2048-rate)
+ * Noise (ch 3):  524288/(r * 2^(s+1)) / f_s; r==0 behaves as r=1/2.
+ * All exact shift-and-divides; b=16 reproduces the historical constants
+ * 1048576, 2097152, 1048576>>(s+1) and 524288. */
+static INLINE fixed16_16 psg_tone_step(u32 rate)
+{
+   return (fixed16_16)((1u << (36 - sound_freq_bits)) / (2048 - rate));
+}
+
+static INLINE fixed16_16 psg_wave_step(u32 rate)
+{
+   return (fixed16_16)((1u << (37 - sound_freq_bits)) / (2048 - rate));
+}
+
+static INLINE fixed16_16 psg_noise_step(u32 dividing_ratio, u32 freq_shift)
+{
+   if(dividing_ratio == 0)
+      return (fixed16_16)((1u << (36 - sound_freq_bits)) >> (freq_shift + 1));
+   return (fixed16_16)((1u << (35 - sound_freq_bits)) /
+                       (dividing_ratio << (freq_shift + 1)));
+}
+
+/* Recompute all rate-derived frequency steps from primary state (defined in
+ * gba_memory.c since it needs timer state). Call on an output-rate change
+ * and after loading a savestate. */
+void sound_frequency_changed(void);
+
+/* Drop pending ring contents and realign producers/consumer (rate change). */
+void sound_flush_ring(void);
+
 #define GBA_SOUND_FREQUENCY   (64 * 1024)
 
 #ifdef OVERCLOCK_60FPS
@@ -99,7 +139,6 @@ extern u32 gbc_sound_master_volume;
 extern u32 gbc_sound_buffer_index;
 extern u32 gbc_sound_last_cpu_ticks;
 
-extern const u32 sound_frequency;
 extern u32 sound_on;
 
 void sound_timer_queue32(u32 channel, u32 value);

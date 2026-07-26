@@ -140,6 +140,17 @@ struct retro_core_option_definition option_defs_us[] = {
       "auto"
    },
    {
+      "gpsp_sound_rate",
+      "Sound Output Rate (Hz)",
+      "Internal audio rendering rate. Both values keep audio timing exact. 65536 renders the full mixer bandwidth; 32768 matches the bandwidth of real hardware's default PWM output and halves audio mixing work.",
+      {
+         { "65536", NULL },
+         { "32768", NULL },
+         { NULL, NULL },
+      },
+      "65536"
+   },
+   {
       "gpsp_frameskip",
       "Frameskip",
       "Skip frames to avoid audio buffer under-run (crackling). Improves performance at the expense of visual smoothness. 'Auto' skips frames when advised by the frontend. 'Auto (Threshold)' utilises the 'Frameskip Threshold (%)' setting. 'Fixed Interval' utilises the 'Frameskip Interval' setting.",
